@@ -2,6 +2,7 @@
 import asyncio
 import curses
 import os
+import shutil
 import tempfile
 from datetime import datetime
 from pathlib import Path
@@ -250,6 +251,51 @@ async def capture_photo(cam, media, profile_token: str, username: str, password:
     return await capture_via_rtsp_ffmpeg(rtsp_url, timeout_sec=10.0)
 
 
+async def start_live_preview(rtsp_url: str):
+    if shutil.which("ffplay") is None:
+        raise RuntimeError("ffplay not found")
+
+    cmd = [
+        "ffplay",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-rtsp_transport",
+        "tcp",
+        "-fflags",
+        "nobuffer",
+        "-flags",
+        "low_delay",
+        "-framedrop",
+        "-window_title",
+        "ONVIF Live Preview",
+        rtsp_url,
+    ]
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdin=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+    return proc
+
+
+async def stop_live_preview(proc):
+    try:
+        proc.terminate()
+    except Exception:
+        pass
+
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=1.5)
+    except asyncio.TimeoutError:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        await proc.wait()
+
+
 def save_jpeg_bytes(image_bytes: bytes, out_dir: Path) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -276,6 +322,7 @@ async def async_main(stdscr):
     margin = float(os.environ.get("PTZ_MARGIN", "0.02"))
     settle = float(os.environ.get("PTZ_SETTLE_SEC", "0.12"))
     probe = float(os.environ.get("PTZ_PROBE", "0.12"))
+    pan_sign_base = float(os.environ.get("PAN_SIGN", "-1.0"))
     capture_dir = Path(os.environ.get("CAPTURE_DIR", "./captures"))
 
     curses.curs_set(0)
@@ -284,6 +331,8 @@ async def async_main(stdscr):
 
     wsdl_dir = f"{os.path.dirname(onvif.__file__)}/wsdl/"
     cam = onvif.ONVIFCamera(host, port, user, password, wsdl_dir=wsdl_dir)
+
+    live_proc = None
 
     try:
         ui_line(stdscr, 0, "connecting ...")
@@ -301,7 +350,7 @@ async def async_main(stdscr):
         pan_min, pan_max, tilt_min, tilt_max = await get_ranges(ptz, profile.PTZConfiguration.token)
 
         # panは左右OK前提
-        pan_sign = 1.0
+        pan_sign = pan_sign_base
         if mount_mode == "ceiling":
             pan_sign *= -1.0
 
@@ -323,18 +372,24 @@ async def async_main(stdscr):
         ui_line(stdscr, 4, "h            : go home (if supported)")
         ui_line(stdscr, 5, "i            : invert tilt (UP/DOWN swap)")
         ui_line(stdscr, 6, "p            : capture photo")
-        ui_line(stdscr, 7, "q            : quit")
+        ui_line(stdscr, 7, "l            : start/stop live preview")
+        ui_line(stdscr, 8, "q            : quit")
         ui_line(stdscr, 9, f"step={step} margin={margin} settle={settle} mount={mount_mode}")
         ui_line(stdscr, 10, f"range pan[{pan_min:.2f},{pan_max:.2f}] tilt[{tilt_min:.2f},{tilt_max:.2f}]")
         ui_line(stdscr, 11, f"tilt_up_sign={tilt_up_sign:+d}")
         stdscr.refresh()
 
         while True:
+            if live_proc is not None and live_proc.returncode is not None:
+                live_proc = None
+                ui_line(stdscr, 15, "live preview stopped")
+
             if pos is not None:
                 x, y = pos
                 ui_line(stdscr, 13, f"pos pan={x:+.3f} tilt={y:+.3f}")
             else:
                 ui_line(stdscr, 13, "pos (not available)")
+            ui_line(stdscr, 12, "live: on" if live_proc is not None else "live: off")
             stdscr.refresh()
 
             key = stdscr.getch()
@@ -366,6 +421,26 @@ async def async_main(stdscr):
                     ui_line(stdscr, 15, f"saved: {path}")
                 except Exception as e:
                     ui_line(stdscr, 15, f"capture failed: {type(e).__name__}: {e}")
+                stdscr.refresh()
+                continue
+
+            if key in (ord("l"), ord("L")):
+                if live_proc is None:
+                    rtsp_url = os.environ.get("STREAM_URL") or get_rtsp_url(host, user, password)
+                    ui_line(stdscr, 15, "live preview starting ...")
+                    stdscr.refresh()
+                    try:
+                        live_proc = await start_live_preview(rtsp_url)
+                        ui_line(stdscr, 15, "live preview started")
+                    except Exception as e:
+                        live_proc = None
+                        ui_line(stdscr, 15, f"live preview failed: {type(e).__name__}: {e}")
+                else:
+                    ui_line(stdscr, 15, "live preview stopping ...")
+                    stdscr.refresh()
+                    await stop_live_preview(live_proc)
+                    live_proc = None
+                    ui_line(stdscr, 15, "live preview stopped")
                 stdscr.refresh()
                 continue
 
@@ -438,6 +513,11 @@ async def async_main(stdscr):
         stdscr.getch()
         raise
     finally:
+        if live_proc is not None:
+            try:
+                await stop_live_preview(live_proc)
+            except Exception:
+                pass
         try:
             await cam.close()
         except Exception:

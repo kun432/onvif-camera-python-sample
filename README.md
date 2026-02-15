@@ -20,6 +20,7 @@
 - Python 3.12以上
 - `uv`
 - `ffmpeg`
+- `ffplay`（通常は`ffmpeg`と一緒にインストールされます）
 - ONVIFに対応したカメラ（このREADMEは`TP-Link Tapo C210`を前提にしています）
 - カメラへ到達できるネットワーク環境
 
@@ -80,6 +81,7 @@ cp .env.sample .env
 | `ONVIF_PORT` | いいえ | ONVIFのポート番号 | `80` |
 | `MOUNT_MODE` | いいえ | 設置向き。`desk`または`ceiling` | `desk` |
 | `PTZ_STEP` | いいえ | 1回の移動量 | `0.10` |
+| `PAN_SIGN` | いいえ | 左右方向の符号。`-1.0`でユーザー視点、`1.0`でカメラ視点 | `-1.0` |
 | `PTZ_MARGIN` | いいえ | パンとチルトの端で止める余白 | `0.02` |
 | `PTZ_SETTLE_SEC` | いいえ | 移動後に待つ秒数 | `0.12` |
 | `PTZ_PROBE` | いいえ | 起動時に上下方向を判定するときの試行量 | `0.12` |
@@ -106,9 +108,10 @@ ONVIF_PASSWORD=your_password
 - `i`: 上下反転
 - `q`: 終了
 
-`capture_pic.py`と`capture_mov.py`では、次の操作を使えます。
+`ptz.py`、`capture_pic.py`、`capture_mov.py`では、次の操作を使えます。
 
 - `p`: 静止画を保存
+- `l`: ライブ表示の開始と停止（`ffplay`が必要）
 
 `capture_mov.py`では、さらに次の操作を使えます。
 

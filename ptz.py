@@ -2,6 +2,7 @@
 import asyncio
 import curses
 import os
+import shutil
 import time
 from typing import Optional, Tuple
 
@@ -69,6 +70,51 @@ async def relative_move(ptz, token, dx: float, dy: float):
             "Translation": {"PanTilt": {"x": dx, "y": dy}},
         }
     )
+
+
+async def start_live_preview(rtsp_url: str):
+    if shutil.which("ffplay") is None:
+        raise RuntimeError("ffplay not found")
+
+    cmd = [
+        "ffplay",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-rtsp_transport",
+        "tcp",
+        "-fflags",
+        "nobuffer",
+        "-flags",
+        "low_delay",
+        "-framedrop",
+        "-window_title",
+        "ONVIF Live Preview",
+        rtsp_url,
+    ]
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdin=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+    return proc
+
+
+async def stop_live_preview(proc):
+    try:
+        proc.terminate()
+    except Exception:
+        pass
+
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=1.5)
+    except asyncio.TimeoutError:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        await proc.wait()
 
 
 async def get_ranges(ptz, cfg_token) -> Tuple[float, float, float, float]:
@@ -198,6 +244,7 @@ async def async_main(stdscr):
     margin = float(os.environ.get("PTZ_MARGIN", "0.02"))
     settle = float(os.environ.get("PTZ_SETTLE_SEC", "0.12"))
     probe = float(os.environ.get("PTZ_PROBE", "0.12"))
+    pan_sign_base = float(os.environ.get("PAN_SIGN", "-1.0"))
 
     curses.curs_set(0)
     stdscr.nodelay(False)
@@ -208,9 +255,10 @@ async def async_main(stdscr):
 
     ptz = None
     token = None
+    live_proc = None
 
     # 反転（ユーザー視点）
-    pan_sign = 1.0
+    pan_sign = pan_sign_base
     tilt_up_sign = +1  # 起動時に決め直す
 
     try:
@@ -253,18 +301,24 @@ async def async_main(stdscr):
         ui_line(stdscr, 2, "Arrow / WASD : move")
         ui_line(stdscr, 4, "h            : go home (if supported)")
         ui_line(stdscr, 5, "i            : invert tilt (UP/DOWN swap)")
-        ui_line(stdscr, 6, "q            : quit")
+        ui_line(stdscr, 6, "l            : start/stop live preview")
+        ui_line(stdscr, 7, "q            : quit")
         ui_line(stdscr, 8, f"step={step} margin={margin} settle={settle} mount={mount_mode}")
         ui_line(stdscr, 9, f"range pan[{pan_min:.2f},{pan_max:.2f}] tilt[{tilt_min:.2f},{tilt_max:.2f}]")
         ui_line(stdscr, 10, f"tilt_up_sign={tilt_up_sign:+d}")
         stdscr.refresh()
 
         while True:
+            if live_proc is not None and live_proc.returncode is not None:
+                live_proc = None
+                ui_line(stdscr, 14, "live preview stopped")
+
             if pos is not None:
                 x, y = pos
                 ui_line(stdscr, 12, f"pos pan={x:+.3f} tilt={y:+.3f}")
             else:
                 ui_line(stdscr, 12, "pos (not available)")
+            ui_line(stdscr, 11, "live: on" if live_proc is not None else "live: off")
             stdscr.refresh()
 
             key = stdscr.getch()
@@ -284,6 +338,26 @@ async def async_main(stdscr):
                 tilt_up_sign *= -1
                 ui_line(stdscr, 10, f"tilt_up_sign={tilt_up_sign:+d}")
                 ui_line(stdscr, 14, "tilt inverted")
+                stdscr.refresh()
+                continue
+
+            if key in (ord("l"), ord("L")):
+                rtsp_url = os.environ.get("STREAM_URL") or f"rtsp://{user}:{password}@{host}:554/stream1"
+                if live_proc is None:
+                    ui_line(stdscr, 14, "live preview starting ...")
+                    stdscr.refresh()
+                    try:
+                        live_proc = await start_live_preview(rtsp_url)
+                        ui_line(stdscr, 14, "live preview started")
+                    except Exception as e:
+                        live_proc = None
+                        ui_line(stdscr, 14, f"live preview failed: {type(e).__name__}: {e}")
+                else:
+                    ui_line(stdscr, 14, "live preview stopping ...")
+                    stdscr.refresh()
+                    await stop_live_preview(live_proc)
+                    live_proc = None
+                    ui_line(stdscr, 14, "live preview stopped")
                 stdscr.refresh()
                 continue
 
@@ -357,6 +431,11 @@ async def async_main(stdscr):
         stdscr.getch()
         raise
     finally:
+        if live_proc is not None:
+            try:
+                await stop_live_preview(live_proc)
+            except Exception:
+                pass
         try:
             await cam.close()
         except Exception:
